@@ -1,48 +1,51 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SCALE BAR — FULL TIMELINE PROCESSOR  (Landscape / 16:9)
-=========================================================
+SCALE BAR: FULL TIMELINE  (Landscape / 16:9)
+============================================
 
-For HORIZONTAL (landscape) timelines only.  For vertical (9:16) phone
-timelines, use "Full timeline scale bar vertical.py" instead.
+I built this with Sonnet to add an accurate scale bar to my microscopy
+clips that stays correct when I zoom in or crop in Resolve.
 
-Fixes scale-bar size drift when you switch the project from 6K to 4K by
-computing the source→comp transform explicitly.
+For each clip on V1, it updates the overlay above it on V2, or places a
+new one, showing:
+  - a scale bar sized from the objective lens calibration
+  - the scale label, e.g. "100µm"
+  - the clip speed, e.g. "2X"
+
+The bar is correct at any timeline resolution (6K, 4K, HD). When a clip
+is zoomed, the label switches to another round value (e.g. 100µm to
+50µm at 2× zoom), so the bar keeps about the same size on screen.
+
+For 9:16 timelines, use the Portrait version. To update only the clips
+you changed, use the Rework script.
 
 PREREQUISITES
-  1. Open DaVinci Resolve Studio and load your project.
-  2. Your timeline must have:
-     - Video clips on V1 (source track)
-     - A "Scale Bar fusion" template overlay on V2, positioned directly
-       above the FIRST V1 clip. This template is the master — all other
-       overlays are cloned from it.
-  3. The template Fusion comp must contain tools named exactly:
-       ScaleBar       (RectangleMask — controls bar width)
-       ScalebarText   (Text+ — displays e.g. "100µm")
-       SpeedRampText  (Text+ — displays e.g. "2X")
-  4. Each source clip should have its Lens Type set in:
+  1. Your project open in DaVinci Resolve Studio, with clips on V1.
+  2. A scale bar template on V2 above the first clip. It's a Fusion
+     composition (also in the Media Pool) with three tools named:
+       ScaleBar       rectangle mask that sets the bar width
+       ScalebarText   Text+ for the scale label
+       SpeedRampText  Text+ for the speed label
+     New overlays copy the template, including its position.
+  3. The objective lens on each clip, in
        Metadata panel > Camera > Lens Type   (e.g. "5X", "10X", "40X")
-     If missing, the script tries the clip filename, then defaults to 40X
-     and prints a warning.
-  5. Ensure the V1 (source track) is not empty and disable auto track
-     selector.
+     If it's missing, the script reads it from the clip name, then
+     falls back to 40X with a warning.
+  4. V2 used only for scale bar overlays. The script deletes V2 items
+     that overlap a clip but don't line up with it.
+  5. Auto track selector off.
 
 HOW TO RUN
-  1. In DaVinci Resolve: Workspace > Scripts
-  2. Select this script and click Run.
-  3. The script processes every V1 clip in order:
-     - Places an overlay copy on V2 if one doesn't exist
-     - Opens the Fusion comp and updates ScaleBar, ScalebarText,
-       SpeedRampText
-     - Adjusts overlay positions to anchor near the top-left of the
-       visible footage rectangle
-  4. Watch the console for progress and results.
-  5. At the end, check the SUMMARY for any clips needing manual attention.
+  1. Workspace > Scripts, select this script and click Run.
+  2. Let it finish. Resolve may switch to the Fusion page and back.
+  3. Check the SUMMARY in Workspace > Console for clips that need a look.
 
 CONFIGURATION
-  - Edit LENS_CALIBRATION below to add/modify lens calibration values.
-  - Set DEBUG = False once everything is working to reduce verbosity.
+  - LENS_CALIBRATION: pixels per 10µm and the default label for each
+    lens. These values are for my microscope and camera.
+  - NICE_STEPS: label values used when a clip is zoomed.
+  - DEBUG = False: quieter console.
 """
 
 import os, re, sys, time
@@ -344,13 +347,80 @@ def compute_scale(lens_key, transform, sensor_w, sensor_h, comp_w, comp_h):
 def frames_overlap(a0, a1, b0, b1):
     return a0 < b1 and b0 < a1
 
+def overlay_aligned_to_clip(overlay_start, overlay_end, clip_start, clip_end,
+                            start_tol=2, dur_tol=2):
+    """True only when an overlay owns this clip (start + duration match).
+
+    Loose overlap is NOT enough: an oversized previous overlay can cover later
+    V1 clips and must not be treated as theirs.
+    """
+    o_start = int(overlay_start)
+    o_end = int(overlay_end)
+    c_start = int(clip_start)
+    c_end = int(clip_end)
+    if abs(o_start - c_start) > start_tol:
+        return False
+    if abs((o_end - o_start) - (c_end - c_start)) > dur_tol:
+        return False
+    return True
+
 def find_overlapping_item(items, start, end):
+    """Any overlap (used only to locate the template above clip #1)."""
     for item in (items or []):
         try:
             if frames_overlap(int(item.GetStart()), int(item.GetEnd()), start, end):
                 return item
         except Exception: continue
     return None
+
+def find_aligned_overlay(items, clip_start, clip_end, start_tol=2, dur_tol=2):
+    """Return the V2 overlay that belongs to this V1 clip, or None."""
+    for item in (items or []):
+        try:
+            if overlay_aligned_to_clip(
+                int(item.GetStart()), int(item.GetEnd()),
+                clip_start, clip_end, start_tol, dur_tol,
+            ):
+                return item
+        except Exception:
+            continue
+    return None
+
+def source_end_frame_for_timeline_duration(desired_tl_frames, media_fps, timeline_fps):
+    """Inclusive AppendToTimeline endFrame for a desired *timeline* duration.
+
+    startFrame/endFrame are in the media-pool item's native FPS. On a mismatched
+    timeline FPS, Resolve retimes: tl_frames ≈ src_frames * timeline_fps / media_fps.
+    """
+    desired = max(1, int(desired_tl_frames))
+    m_fps = float(media_fps) if media_fps else 0.0
+    t_fps = float(timeline_fps) if timeline_fps else 0.0
+    if m_fps <= 0 or t_fps <= 0 or abs(m_fps - t_fps) < 0.01:
+        return desired - 1
+    src_count = max(1, int(round(desired * m_fps / t_fps)))
+    return src_count - 1
+
+def correct_source_end_frame(prev_end_frame, actual_tl, desired_tl):
+    """Closed-loop correction after a measured AppendToTimeline duration miss."""
+    src_used = max(1, int(prev_end_frame) + 1)
+    actual = max(1, int(actual_tl))
+    desired = max(1, int(desired_tl))
+    src_needed = max(1, int(round(src_used * desired / float(actual))))
+    return src_needed - 1
+
+def get_mpi_fps(mp_item, fallback_fps):
+    """Read media-pool FPS; fall back to timeline FPS if unavailable."""
+    if mp_item is not None:
+        for key in ("FPS", "Frame Rate", "Video Frame Rate"):
+            try:
+                raw = get_clip_property_by_key(mp_item, key)
+                if raw not in (None, ""):
+                    val = float(str(raw).strip().replace(",", "."))
+                    if val > 0:
+                        return val
+            except Exception:
+                pass
+    return float(fallback_fps)
 
 # ── Robust metadata / property access ─────────────────────────────────────────
 def get_metadata_by_key(mpi, target_key):
@@ -603,34 +673,82 @@ def navigate_to_comp(resolve, timeline, overlay_item, fps):
 
 # ── TIMELINE PLACEMENT ────────────────────────────────────────────────────────
 
-def duplicate_to_timeline(media_pool, template_item, record_frame, duration_frames, track_index):
-    """Place a copy of the template Fusion comp on V2 at the specified position."""
-    mp_item = template_item.GetMediaPoolItem()
+def _append_overlay(media_pool, mp_item, record_frame, end_frame, track_index):
+    appended = media_pool.AppendToTimeline([{
+        "mediaPoolItem": mp_item,
+        "startFrame":    0,
+        "endFrame":      int(end_frame),
+        "trackIndex":    track_index,
+        "recordFrame":   int(record_frame),
+        "mediaType":     1,
+    }])
+    if not appended:
+        raise RuntimeError(f"AppendToTimeline failed for V{track_index}.")
+    return appended[0]
+
+
+def resolve_template_mp_item(media_pool, template_item):
+    """Stable MediaPoolItem for cloning — survives DeleteClips on the timeline item."""
+    mp_item = None
+    try:
+        mp_item = template_item.GetMediaPoolItem()
+    except Exception:
+        mp_item = None
     if mp_item is None:
         mp_item = search_media_pool(media_pool.GetRootFolder(), template_item.GetName())
     if mp_item is None:
         raise RuntimeError(f"Cannot find '{template_item.GetName()}' in the Media Pool.")
+    return mp_item
+
+
+def duplicate_to_timeline(media_pool, template_item, record_frame, duration_frames,
+                          track_index, timeline_fps, timeline=None, mp_item=None):
+    """Place a copy of the template Fusion comp on V2 at the specified position.
+
+    Compensates for media-pool FPS ≠ timeline FPS (common after Resolve updates
+    or when a Fusion template was created under a different project FPS). Retries
+    once with a measured closed-loop correction if duration is still wrong.
+    """
+    if mp_item is None:
+        mp_item = resolve_template_mp_item(media_pool, template_item)
 
     desired_dur = max(1, int(duration_frames))
-    appended = media_pool.AppendToTimeline([{
-        "mediaPoolItem": mp_item,
-        "startFrame":    0,
-        "endFrame":      desired_dur - 1,
-        "trackIndex":    track_index,
-        "recordFrame":   int(record_frame),
-    }])
-    if not appended:
-        raise RuntimeError(f"AppendToTimeline failed for V{track_index}.")
+    media_fps = get_mpi_fps(mp_item, timeline_fps)
+    end_frame = source_end_frame_for_timeline_duration(
+        desired_dur, media_fps, timeline_fps,
+    )
 
-    new_item = appended[0]
-    actual_start = int(new_item.GetStart())
-    actual_end   = int(new_item.GetEnd())
-    actual_dur   = actual_end - actual_start
+    if DEBUG and abs(float(media_fps) - float(timeline_fps)) >= 0.01:
+        print(f"       Placement: media FPS {media_fps} → timeline {timeline_fps}; "
+              f"endFrame={end_frame} (for {desired_dur} tl frames)")
 
-    if actual_dur != desired_dur:
-        print(f"       Note: V2 duration {actual_dur}f (wanted {desired_dur}f)")
+    new_item = _append_overlay(media_pool, mp_item, record_frame, end_frame, track_index)
+    actual_dur = int(new_item.GetEnd()) - int(new_item.GetStart())
 
-    copy_inspector_properties(template_item, new_item)
+    if abs(actual_dur - desired_dur) > 2 and timeline is not None:
+        corrected_end = correct_source_end_frame(end_frame, actual_dur, desired_dur)
+        if DEBUG:
+            print(f"       Placement retry: got {actual_dur}f, correcting "
+                  f"endFrame {end_frame} → {corrected_end}")
+        try:
+            timeline.DeleteClips([new_item], False)
+        except Exception:
+            pass
+        time.sleep(0.15)
+        new_item = _append_overlay(
+            media_pool, mp_item, record_frame, corrected_end, track_index,
+        )
+        actual_dur = int(new_item.GetEnd()) - int(new_item.GetStart())
+
+    if abs(actual_dur - desired_dur) > 2:
+        print(f"       \u26a0 Note: V2 duration {actual_dur}f (wanted {desired_dur}f)")
+    elif DEBUG and actual_dur != desired_dur:
+        print(f"       Note: V2 duration {actual_dur}f (wanted {desired_dur}f, within tol)")
+
+    try:
+        copy_inspector_properties(template_item, new_item)
+    except Exception:
+        pass
     return new_item
 
 # ── OVERLAY POSITION ADJUSTMENT ───────────────────────────────────────────────
@@ -875,7 +993,7 @@ def main():
     print(f"  Resolution    : {comp_w} x {comp_h}  [LANDSCAPE]")
     if comp_h > comp_w:
         print(f"  \u26a0 WARNING: Timeline looks vertical ({comp_w}x{comp_h}).")
-        print(f"    Use 'Full timeline scale bar vertical.py' for 9:16 projects.")
+        print(f"    Use the Portrait version of this script for 9:16 projects.")
     print(f"  Timeline FPS  : {fps}")
 
     v1_clips = sorted(
@@ -903,6 +1021,17 @@ def main():
     t_dur = int(template_item.GetEnd()) - int(template_item.GetStart())
     print(f"  Template      : '{template_item.GetName()}' ({t_dur} frames)")
     print(f"  V1 clips      : {len(v1_clips)}")
+
+    try:
+        template_mp_item = resolve_template_mp_item(media_pool, template_item)
+        tmpl_fps = get_mpi_fps(template_mp_item, fps)
+        if abs(tmpl_fps - fps) >= 0.01:
+            print(f"  Template FPS  : {tmpl_fps}  (timeline {fps} — will convert on place)")
+        else:
+            print(f"  Template FPS  : {tmpl_fps}")
+    except RuntimeError as exc:
+        print(f"\n\u26a0 ERROR: {exc}")
+        return
 
     # ── Validate template has required tools ──
     template_comp = try_comp_from_item(template_item)
@@ -936,7 +1065,6 @@ def main():
         duration   = clip_end - clip_start
         if duration <= 0:
             duration = int(src_clip.GetDuration())
-        is_first = (clip_start == first_start and clip_end == first_end)
 
         # ── Switch to Edit page & position playhead BEFORE reading props ──
         resolve.OpenPage("edit")
@@ -995,27 +1123,46 @@ def main():
                   f"eff_scale={eff_s:.4f}")
 
         # ── Ensure overlay on V2 ──
+        # Aligned match only (start + duration). Loose overlap from an oversized
+        # previous overlay must NOT count as "exists" for this clip.
         v2_items = timeline.GetItemListInTrack("video", SCALE_BAR_TRACK_INDEX) or []
-        overlay_item = find_overlapping_item(v2_items, clip_start, clip_end)
+        overlay_item = find_aligned_overlay(v2_items, clip_start, clip_end)
 
         if overlay_item is None:
-            if is_first:
-                overlay_item = template_item
-                print("       Overlay: template (in place)")
-            else:
+            blockers = []
+            for item in v2_items:
                 try:
-                    overlay_item = duplicate_to_timeline(
-                        media_pool, template_item,
-                        clip_start, duration, SCALE_BAR_TRACK_INDEX,
-                    )
-                    print(f"       Overlay: placed (frames {clip_start}\u2013{clip_end-1})")
-                    time.sleep(0.3)
-                except RuntimeError as exc:
-                    print(f"       \u26a0 ERROR placing overlay: {exc}")
-                    warnings.append((clip_num, clip_name, [f"Placement failed: {exc}"]))
-                    skipped += 1
-                    print()
+                    if frames_overlap(
+                        int(item.GetStart()), int(item.GetEnd()),
+                        clip_start, clip_end,
+                    ):
+                        blockers.append(item)
+                except Exception:
                     continue
+            if blockers:
+                try:
+                    timeline.DeleteClips(blockers, False)
+                    print(f"       Overlay: removed {len(blockers)} misaligned V2 item(s)")
+                    time.sleep(0.2)
+                except Exception as exc:
+                    print(f"       \u26a0 Could not clear blocking V2 items: {exc}")
+
+            try:
+                overlay_item = duplicate_to_timeline(
+                    media_pool, template_item,
+                    clip_start, duration, SCALE_BAR_TRACK_INDEX,
+                    fps, timeline=timeline, mp_item=template_mp_item,
+                )
+                # Keep a live timeline item for inspector-property copy on later clones
+                template_item = overlay_item
+                print(f"       Overlay: placed (frames {clip_start}\u2013{clip_end - 1})")
+                time.sleep(0.3)
+            except RuntimeError as exc:
+                print(f"       \u26a0 ERROR placing overlay: {exc}")
+                warnings.append((clip_num, clip_name, [f"Placement failed: {exc}"]))
+                skipped += 1
+                print()
+                continue
         else:
             print("       Overlay: exists \u2014 updating")
 

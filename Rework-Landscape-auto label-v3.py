@@ -1,50 +1,48 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-SCALE BAR — CLIP REWORK (Vertical / 9:16)
-==========================================
+SCALE BAR: REWORK CHANGED CLIPS  (Landscape / 16:9)
+===================================================
 
-For VERTICAL (9:16 phone) timelines only.  For landscape (16:9)
-timelines, use "Rework timeline scale_bar 08072026.py" instead.
+I built this with Sonnet to update scale bars quickly after small edits.
+It does the same job as the Full-timeline script, but only for V1 clips
+that:
+  - are tagged ClipRework = "New", or
+  - have no overlay on V2 that lines up with them (a new or trimmed clip)
+Other clips stay as they are. Tags are cleared once a clip is done.
 
-Uses smaller per-lens default scale labels (~half of landscape) so the
-bar does not overlap the speed icon on narrow phone frames.
-
-Selectively processes only clips that need attention:
-  1. V1 clips tagged with ClipRework = "New" in metadata
-  2. V1 clips with NO overlay on V2 (empty gap above them)
-
-After updating, clears the ClipRework tag back to "" automatically.
-
-Fixes scale-bar size drift when switching project from 6K to 4K by
-computing the source→comp transform explicitly.
+For 9:16 timelines, use the Portrait version.
 
 PREREQUISITES
-  1. Open DaVinci Resolve Studio and load your project.
-  2. Your timeline must have:
-     - Video clips on V1 (source track)
-     - A "Scale Bar fusion" template overlay on V2, positioned directly
-       above the FIRST V1 clip.
-  3. The template Fusion comp must contain tools named exactly:
-       ScaleBar       (RectangleMask — controls bar width)
-       ScalebarText   (Text+ — displays e.g. "100µm")
-       SpeedRampText  (Text+ — displays e.g. "2X")
-  4. Each source clip should have its Lens Type set in:
+  1. Your project open in DaVinci Resolve Studio, with clips on V1.
+  2. A scale bar template on V2 above the first clip. It's a Fusion
+     composition (also in the Media Pool) with three tools named:
+       ScaleBar       rectangle mask that sets the bar width
+       ScalebarText   Text+ for the scale label
+       SpeedRampText  Text+ for the speed label
+     New overlays copy the template, including its position.
+  3. The objective lens on each clip, in
        Metadata panel > Camera > Lens Type   (e.g. "5X", "10X", "40X")
-  5. To flag a clip for rework:
-       Metadata panel > add a custom field "ClipRework" > set value to "New"
+     If it's missing, the script reads it from the clip name, then
+     falls back to 40X with a warning.
+  4. V2 used only for scale bar overlays. The script deletes V2 items
+     that overlap a clip but don't line up with it.
+  5. A custom metadata field named "ClipRework". One-time setup:
+       Library > Metadata > add a custom field "ClipRework"
 
 HOW TO RUN
-  1. Tag any reworked clips: set metadata field ClipRework = "New"
-  2. In DaVinci Resolve: Workspace > Scripts
-  3. Select this script and click Run.
-  4. The script scans V1 for clips tagged "New" or missing V2 overlays.
-  5. It places/updates overlays, then clears the tag automatically.
-  6. Check the SUMMARY at the end for any clips needing manual attention.
+  1. Set ClipRework to "New" on each clip you changed. New or trimmed
+     clips are picked up without a tag.
+  2. Workspace > Scripts, select this script and click Run.
+  3. Let it finish. Resolve may switch to the Fusion page and back.
+  4. Check the SUMMARY in Workspace > Console for clips that need a look.
 
-SETUP (first time):
-  In Resolve > Library > Metadata > add a custom field called "ClipRework".
-  Tag any clip you've reworked with value "New" and re-run this script.
+CONFIGURATION
+  - LENS_CALIBRATION: pixels per 10µm and the default label for each
+    lens. These values are for my microscope and camera.
+  - NICE_STEPS: label values used when a clip is zoomed.
+  - CLIPREWORK_FIELD, CLIPREWORK_VALUE: the tag that marks a clip.
+  - DEBUG = False: quieter console.
 """
 
 import os, re, sys, time
@@ -58,14 +56,13 @@ ZOOM_TOLERANCE         = 0.05
 NICE_STEPS             = [10, 25, 50, 100, 200, 500, 1000]
 DEBUG                  = True
 
-# Per-lens defaults are ~half of landscape so the bar fits the narrow frame
 LENS_CALIBRATION = {
-    "63X":  {"px_per_10um": 346.5,  "default_microns": 25},
-    "40X":  {"px_per_10um": 220.0,  "default_microns": 50},
-    "20X":  {"px_per_10um": 110.0,  "default_microns": 100},
-    "10X":  {"px_per_10um": 55.0,   "default_microns": 25},
-    "5X":   {"px_per_10um": 27.5,   "default_microns": 50},
-    "2.5X": {"px_per_10um": 14.057, "default_microns": 100},
+    "63X":  {"px_per_10um": 346.5,  "default_microns": 50},
+    "40X":  {"px_per_10um": 220.0,  "default_microns": 100},
+    "20X":  {"px_per_10um": 110.0,  "default_microns": 200},
+    "10X":  {"px_per_10um": 55.0,   "default_microns": 50},
+    "5X":   {"px_per_10um": 27.5,   "default_microns": 100},
+    "2.5X": {"px_per_10um": 14.057, "default_microns": 200},
 }
 DEFAULT_LENS = "40X"
 
@@ -217,7 +214,7 @@ def get_clip_transform(clip):
 # ── GEOMETRY ──────────────────────────────────────────────────────────────────
 
 def compute_fit_scale(sensor_w, sensor_h, comp_w, comp_h):
-    """Compute the base scale factor for a vertical timeline."""
+    """Compute the base scale factor for a landscape timeline."""
     src_aspect = float(sensor_w) / float(sensor_h)
     comp_aspect = float(comp_w) / float(comp_h)
 
@@ -225,8 +222,8 @@ def compute_fit_scale(sensor_w, sensor_h, comp_w, comp_h):
         scale = float(comp_w) / float(sensor_w)
         return scale, scale, "same_aspect"
 
-    scale = float(comp_h) / float(sensor_h)
-    return scale, scale, "fit_height"
+    scale = float(comp_w) / float(sensor_w)
+    return scale, scale, "fit_width"
 
 
 def compute_visible_rect(sensor_w, sensor_h, comp_w, comp_h, transform):
@@ -306,13 +303,80 @@ def compute_scale(lens_key, transform, sensor_w, sensor_h, comp_w, comp_h):
 def frames_overlap(a0, a1, b0, b1):
     return a0 < b1 and b0 < a1
 
+def overlay_aligned_to_clip(overlay_start, overlay_end, clip_start, clip_end,
+                            start_tol=2, dur_tol=2):
+    """True only when an overlay owns this clip (start + duration match).
+
+    Loose overlap is NOT enough: an oversized previous overlay can cover later
+    V1 clips and must not be treated as theirs.
+    """
+    o_start = int(overlay_start)
+    o_end = int(overlay_end)
+    c_start = int(clip_start)
+    c_end = int(clip_end)
+    if abs(o_start - c_start) > start_tol:
+        return False
+    if abs((o_end - o_start) - (c_end - c_start)) > dur_tol:
+        return False
+    return True
+
 def find_overlapping_item(items, start, end):
+    """Any overlap (used only to locate the template above clip #1)."""
     for item in (items or []):
         try:
             if frames_overlap(int(item.GetStart()), int(item.GetEnd()), start, end):
                 return item
         except Exception: continue
     return None
+
+def find_aligned_overlay(items, clip_start, clip_end, start_tol=2, dur_tol=2):
+    """Return the V2 overlay that belongs to this V1 clip, or None."""
+    for item in (items or []):
+        try:
+            if overlay_aligned_to_clip(
+                int(item.GetStart()), int(item.GetEnd()),
+                clip_start, clip_end, start_tol, dur_tol,
+            ):
+                return item
+        except Exception:
+            continue
+    return None
+
+def source_end_frame_for_timeline_duration(desired_tl_frames, media_fps, timeline_fps):
+    """Inclusive AppendToTimeline endFrame for a desired *timeline* duration.
+
+    startFrame/endFrame are in the media-pool item's native FPS. On a mismatched
+    timeline FPS, Resolve retimes: tl_frames ≈ src_frames * timeline_fps / media_fps.
+    """
+    desired = max(1, int(desired_tl_frames))
+    m_fps = float(media_fps) if media_fps else 0.0
+    t_fps = float(timeline_fps) if timeline_fps else 0.0
+    if m_fps <= 0 or t_fps <= 0 or abs(m_fps - t_fps) < 0.01:
+        return desired - 1
+    src_count = max(1, int(round(desired * m_fps / t_fps)))
+    return src_count - 1
+
+def correct_source_end_frame(prev_end_frame, actual_tl, desired_tl):
+    """Closed-loop correction after a measured AppendToTimeline duration miss."""
+    src_used = max(1, int(prev_end_frame) + 1)
+    actual = max(1, int(actual_tl))
+    desired = max(1, int(desired_tl))
+    src_needed = max(1, int(round(src_used * desired / float(actual))))
+    return src_needed - 1
+
+def get_mpi_fps(mp_item, fallback_fps):
+    """Read media-pool FPS; fall back to timeline FPS if unavailable."""
+    if mp_item is not None:
+        for key in ("FPS", "Frame Rate", "Video Frame Rate"):
+            try:
+                raw = get_clip_property_by_key(mp_item, key)
+                if raw not in (None, ""):
+                    val = float(str(raw).strip().replace(",", "."))
+                    if val > 0:
+                        return val
+            except Exception:
+                pass
+    return float(fallback_fps)
 
 def get_metadata_by_key(mpi, target_key):
     """Case/space-insensitive metadata lookup."""
@@ -531,31 +595,82 @@ def navigate_to_comp(resolve, timeline, overlay_item, fps):
 
 # ── TIMELINE PLACEMENT ────────────────────────────────────────────────────────
 
-def duplicate_to_timeline(media_pool, template_item, record_frame, duration_frames, track_index):
-    """Place a copy of the template Fusion comp on V2 at the specified position."""
-    mp_item = template_item.GetMediaPoolItem()
+def _append_overlay(media_pool, mp_item, record_frame, end_frame, track_index):
+    appended = media_pool.AppendToTimeline([{
+        "mediaPoolItem": mp_item,
+        "startFrame":    0,
+        "endFrame":      int(end_frame),
+        "trackIndex":    track_index,
+        "recordFrame":   int(record_frame),
+        "mediaType":     1,
+    }])
+    if not appended:
+        raise RuntimeError(f"AppendToTimeline failed for V{track_index}.")
+    return appended[0]
+
+
+def resolve_template_mp_item(media_pool, template_item):
+    """Stable MediaPoolItem for cloning — survives DeleteClips on the timeline item."""
+    mp_item = None
+    try:
+        mp_item = template_item.GetMediaPoolItem()
+    except Exception:
+        mp_item = None
     if mp_item is None:
         mp_item = search_media_pool(media_pool.GetRootFolder(), template_item.GetName())
     if mp_item is None:
         raise RuntimeError(f"Cannot find '{template_item.GetName()}' in the Media Pool.")
+    return mp_item
+
+
+def duplicate_to_timeline(media_pool, template_item, record_frame, duration_frames,
+                          track_index, timeline_fps, timeline=None, mp_item=None):
+    """Place a copy of the template Fusion comp on V2 at the specified position.
+
+    Compensates for media-pool FPS ≠ timeline FPS (common after Resolve updates
+    or when a Fusion template was created under a different project FPS). Retries
+    once with a measured closed-loop correction if duration is still wrong.
+    """
+    if mp_item is None:
+        mp_item = resolve_template_mp_item(media_pool, template_item)
 
     desired_dur = max(1, int(duration_frames))
-    appended = media_pool.AppendToTimeline([{
-        "mediaPoolItem": mp_item,
-        "startFrame":    0,
-        "endFrame":      desired_dur - 1,
-        "trackIndex":    track_index,
-        "recordFrame":   int(record_frame),
-    }])
-    if not appended:
-        raise RuntimeError(f"AppendToTimeline failed for V{track_index}.")
+    media_fps = get_mpi_fps(mp_item, timeline_fps)
+    end_frame = source_end_frame_for_timeline_duration(
+        desired_dur, media_fps, timeline_fps,
+    )
 
-    new_item = appended[0]
+    if DEBUG and abs(float(media_fps) - float(timeline_fps)) >= 0.01:
+        print(f"       Placement: media FPS {media_fps} → timeline {timeline_fps}; "
+              f"endFrame={end_frame} (for {desired_dur} tl frames)")
+
+    new_item = _append_overlay(media_pool, mp_item, record_frame, end_frame, track_index)
     actual_dur = int(new_item.GetEnd()) - int(new_item.GetStart())
-    if actual_dur != desired_dur:
-        print(f"       Note: V2 duration {actual_dur}f (wanted {desired_dur}f)")
 
-    copy_inspector_properties(template_item, new_item)
+    if abs(actual_dur - desired_dur) > 2 and timeline is not None:
+        corrected_end = correct_source_end_frame(end_frame, actual_dur, desired_dur)
+        if DEBUG:
+            print(f"       Placement retry: got {actual_dur}f, correcting "
+                  f"endFrame {end_frame} → {corrected_end}")
+        try:
+            timeline.DeleteClips([new_item], False)
+        except Exception:
+            pass
+        time.sleep(0.15)
+        new_item = _append_overlay(
+            media_pool, mp_item, record_frame, corrected_end, track_index,
+        )
+        actual_dur = int(new_item.GetEnd()) - int(new_item.GetStart())
+
+    if abs(actual_dur - desired_dur) > 2:
+        print(f"       \u26a0 Note: V2 duration {actual_dur}f (wanted {desired_dur}f)")
+    elif DEBUG and actual_dur != desired_dur:
+        print(f"       Note: V2 duration {actual_dur}f (wanted {desired_dur}f, within tol)")
+
+    try:
+        copy_inspector_properties(template_item, new_item)
+    except Exception:
+        pass
     return new_item
 
 # ── OVERLAY POSITION ADJUSTMENT ───────────────────────────────────────────────
@@ -773,7 +888,7 @@ def clear_clip_rework_flag(clip):
 # =============================================================================
 def main():
     print("=" * 60)
-    print("  SCALE BAR \u2014 CLIP REWORK (Vertical 9:16)")
+    print("  SCALE BAR \u2014 CLIP REWORK (Landscape)")
     print("=" * 60)
 
     resolve    = get_resolve()
@@ -795,10 +910,10 @@ def main():
     print()
     print("PROJECT SETTINGS")
     print(f"  Timeline      : {timeline.GetName()}")
-    print(f"  Resolution    : {comp_w} x {comp_h}  [VERTICAL 9:16]")
-    if comp_h <= comp_w:
-        print(f"  \u26a0 WARNING: Timeline looks landscape ({comp_w}x{comp_h}).")
-        print(f"    Use 'Rework timeline scale_bar 08072026.py' for 16:9 projects.")
+    print(f"  Resolution    : {comp_w} x {comp_h}  [LANDSCAPE]")
+    if comp_h > comp_w:
+        print(f"  \u26a0 WARNING: Timeline looks vertical ({comp_w}x{comp_h}).")
+        print(f"    Use the Portrait version of this script for 9:16 projects.")
     print(f"  Timeline FPS  : {fps}")
 
     v1_clips = sorted(
@@ -827,6 +942,17 @@ def main():
     print(f"  V1 clips      : {len(v1_clips)}")
     print(f"  Trigger       : ClipRework = '{CLIPREWORK_VALUE}' OR empty V2")
 
+    try:
+        template_mp_item = resolve_template_mp_item(media_pool, template_item)
+        tmpl_fps = get_mpi_fps(template_mp_item, fps)
+        if abs(tmpl_fps - fps) >= 0.01:
+            print(f"  Template FPS  : {tmpl_fps}  (timeline {fps} — will convert on place)")
+        else:
+            print(f"  Template FPS  : {tmpl_fps}")
+    except RuntimeError as exc:
+        print(f"\n\u26a0 ERROR: {exc}")
+        return
+
     # ── Scan: which clips need work? ─────────────────────────────────────
     v2_items = timeline.GetItemListInTrack("video", SCALE_BAR_TRACK_INDEX) or []
     to_process = []
@@ -835,7 +961,8 @@ def main():
         clip_start = int(src_clip.GetStart())
         clip_end   = int(src_clip.GetEnd())
         rework     = get_clip_rework_flag(src_clip)
-        overlay    = find_overlapping_item(v2_items, clip_start, clip_end)
+        # Aligned only — oversized neighbour overlays must not hide missing V2
+        overlay    = find_aligned_overlay(v2_items, clip_start, clip_end)
 
         if overlay is None:
             to_process.append((src_clip, "no overlay on V2", None))
@@ -866,24 +993,43 @@ def main():
         duration   = clip_end - clip_start
         if duration <= 0:
             duration = int(src_clip.GetDuration())
-        is_first = (clip_start == first_start and clip_end == first_end)
 
         if existing_overlay is not None:
             work_list.append((src_clip, existing_overlay, reason))
             print(f"  '{src_clip.GetName()}' \u2014 {reason} (overlay exists, will update)")
-        elif is_first:
-            work_list.append((src_clip, template_item, reason))
-            print(f"  '{src_clip.GetName()}' \u2014 {reason} (template in place)")
-        else:
+            continue
+
+        v2_now = timeline.GetItemListInTrack("video", SCALE_BAR_TRACK_INDEX) or []
+        blockers = []
+        for item in v2_now:
             try:
-                item = duplicate_to_timeline(
-                    media_pool, template_item,
-                    clip_start, duration, SCALE_BAR_TRACK_INDEX,
-                )
-                work_list.append((src_clip, item, reason))
-                print(f"  '{src_clip.GetName()}' \u2014 {reason} \u2192 placed (frames {clip_start}\u2013{clip_end-1})")
-            except RuntimeError as exc:
-                print(f"  '{src_clip.GetName()}' \u2014 \u26a0 ERROR placing: {exc}")
+                if frames_overlap(
+                    int(item.GetStart()), int(item.GetEnd()),
+                    clip_start, clip_end,
+                ):
+                    blockers.append(item)
+            except Exception:
+                continue
+        if blockers:
+            try:
+                timeline.DeleteClips(blockers, False)
+                print(f"  '{src_clip.GetName()}' \u2014 removed {len(blockers)} misaligned V2 item(s)")
+                time.sleep(0.2)
+            except Exception as exc:
+                print(f"  '{src_clip.GetName()}' \u2014 \u26a0 Could not clear blockers: {exc}")
+
+        try:
+            item = duplicate_to_timeline(
+                media_pool, template_item,
+                clip_start, duration, SCALE_BAR_TRACK_INDEX,
+                fps, timeline=timeline, mp_item=template_mp_item,
+            )
+            template_item = item
+            work_list.append((src_clip, item, reason))
+            print(f"  '{src_clip.GetName()}' \u2014 {reason} \u2192 placed "
+                  f"(frames {clip_start}\u2013{clip_end - 1})")
+        except RuntimeError as exc:
+            print(f"  '{src_clip.GetName()}' \u2014 \u26a0 ERROR placing: {exc}")
 
     # ── Phase 2: Update comps (Fusion page) ───────────────────────────────
     total = len(work_list)
