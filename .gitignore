@@ -1,0 +1,10 @@
+# Allowlist: only the public files below are tracked. Everything else in
+# this folder (notes, logs, tests, old versions, local config) stays private.
+/*
+!/.gitignore
+!/README.md
+!/Full-timeline-Landscape-auto label-v3.py
+!/Full-timeline-Portrait-auto label-v3.py
+!/Rework-Landscape-auto label-v3.py
+!/Rework-Portrait-auto label-v3.py
+!/Retime_automation-v2.py

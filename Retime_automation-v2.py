@@ -1,62 +1,70 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AUTOMATIC RETIME CONTROLS — GUI AUTOMATION (v4, coordinate-free)
-===============================================================
+RETIME AUTOMATION: SPEED UP LONG V1 CLIPS  (macOS only)
+=======================================================
 
-Automatically adjusts clip playback speed for clips on Video Track 1 (V1)
-to an optimal duration (3.8–6.0 s, targeting ~4.5 s), using clean speed
-multipliers (1.1×, 1.2×, 1.5×, 2×, 2.5×, …). Clips ≤ 6 s are left untouched.
+I built this with Sonnet to retime all the long microscopy clips on a
+timeline in one go. Every V1 clip longer than 6 s is sped up to play in
+3.8–6 s (about 4.5 s) at a clean speed such as 1.5×, 2× or 3×, and set to
+Optical Flow. Shorter clips stay as they are.
 
-The DaVinci Resolve API cannot change timeline-clip speed, so the native
-"Change Clip Speed" dialog is driven via AppleScript; Optical Flow is set
-via the API afterward.
+Short clips make the timeline easy to scroll through and compare, so I
+can see what I have. Then I rework single clips as the film needs it
+like to slow down or show a detail.
 
-WHY v4 WORKS (each earlier failure was diagnosed with GUI probes):
+Resolve's scripting API can't change clip speed, so the script uses the
+Change Clip Speed dialog through AppleScript and checks each result
+through the API. So it only runs on macOS, and the keyboard and mouse
+must stay untouched while it runs.
 
-  SELECTION — coordinate-free, no pixel clicking.
-    Deselect All (Edit menu) → SetCurrentTimecode(clip centre) via API →
-    Shift+V ("Select Nearest Clip/Gap"). Probed to select exactly the
-    target V1 clip. Confirmed by the Clip-menu enabled-state, which is
-    true iff a clip is GUI-selected. (The old pixel-click missed the V1
-    row, and GetCurrentVideoItem was a false confirmation — it only
-    reports the clip under the playhead, not the selected one.)
+PREREQUISITES
+  1. DaVinci Resolve Studio on macOS, in English (menus are clicked by
+     name), with the default Shift+V shortcut (Select Nearest Clip/Gap).
+  2. Accessibility access for the app that starts the script (Terminal,
+     or DaVinci Resolve itself):
+       System Settings > Privacy & Security > Accessibility
+  3. For Terminal runs: Preferences > System > General >
+     External scripting using = Local.
 
-  DIALOG — correct path, probed to exist:
-    Clip → "Clip Speed" submenu → "Change Clip Speed"  (opens the dialog
-    with the Speed % field). NOT "Change Clip Duration…" (wrong dialog).
-
-  FILL — the dialog exposes no text fields to AppleScript, but the Speed
-    field is focused with its value pre-selected on open, so we type blind:
-    digits → Return (Return triggers the default "Change" button). We do NOT
-    send Cmd+A first: the dialog is a non-modal floating window, so Cmd+A
-    fires the app-wide Edit > Select All (highlighting every timeline clip and
-    stealing dialog focus) instead of selecting the field text — that broke
-    every clip in the first real v4 run. Ripple is left at its default OFF, so
-    shortened clips leave a gap.
-
-  VERIFY — after each dialog, the clip's GetDuration() is re-read and
-    compared to expected (original / multiplier):
-      unchanged  → retry (dialog likely never applied)
-      wrong      → flag CHECK ⚠ (never re-applied; speeds would compound)
-      in range   → RETIMED ✓, then Optical Flow via API.
-
-═══════════════════════════════════════════════════════════════════════════
 HOW TO RUN
-═══════════════════════════════════════════════════════════════════════════
+  1. Open the timeline on the Edit page.
+  2. Start the script from Terminal:
+         python3 Retime_automation-v2.py --dry-run    # plan only
+         python3 Retime_automation-v2.py              # real run
+     or from Resolve: Workspace > Scripts, select this script. A Resolve
+     run is always a real run; output shows in Workspace > Console.
+  3. During the 4 s countdown, click the timeline so it has focus. Then
+     leave the keyboard and mouse alone until the summary prints.
+  4. Read the summary:
+       RETIMED ✓   speed applied and checked
+       CHECK ⚠     duration changed, but not as expected; take a look
+       FAILED ✖    speed couldn't be applied after 3 tries
+       SKIP        already 6 s or shorter
+     To inspect a clip, select it and press Cmd+R.
 
-  1. Open DaVinci Resolve Studio, load the project, open the EDIT page with
-     the target timeline visible and the timeline panel focused.
-  2. Dry run first (no changes, prints the plan):
-         python3 Retime_automation.py --dry-run
-  3. Real run:
-         python3 Retime_automation.py
-     During the countdown, switch to Resolve and don't touch the keyboard.
-  4. Review: select a retimed clip → Cmd+R (Retime Controls).
+  Ripple is off, so shortened clips leave gaps. Close them afterwards if
+  you need to.
 
-  No third-party packages are required (pure AppleScript + API).
-  macOS Accessibility: the app that RUNS this script (e.g. Terminal) must be
-  enabled in System Settings → Privacy & Security → Accessibility.
+HOW IT WORKS (per clip)
+  1. Select: Edit > Deselect All, playhead to the clip's middle (API),
+     then Shift+V. Confirmed when Clip > Change Clip Duration… is
+     enabled. (GetCurrentVideoItem can't confirm it: it returns the clip
+     under the playhead, not the selected one.)
+  2. Open: Clip > Clip Speed > Change Clip Speed. The Speed field opens
+     focused, with its value selected.
+  3. Fill: type the speed % and press Return. No Cmd+A: in this floating
+     dialog it selects every timeline clip instead of the field text.
+  4. Check: re-read the duration through the API. Unchanged: retry, up
+     to 3 times. Changed: set Optical Flow, and mark CHECK if it's more
+     than ~6% off. No retry then, since a second change would stack.
+
+CONFIGURATION
+  - MIN_TARGET_DURATION, MAX_TARGET_DURATION, IDEAL_TARGET: the target
+    duration window, in seconds.
+  - CLEAN_MULTIPLIERS: the speeds to choose from.
+  - Timing values: raise them if Resolve is slow to respond.
+  - DEBUG = False: quieter console.
 """
 
 import os
@@ -429,7 +437,7 @@ DIVW = "═" * 64
 def print_banner():
     print("")
     print(DIVW)
-    print("  AUTOMATIC RETIME CONTROLS — GUI AUTOMATION  (v4)")
+    print("  AUTOMATIC RETIME CONTROLS — GUI AUTOMATION")
     print(DIVW)
 
 
@@ -560,7 +568,8 @@ def main():
     print("")
 
     for i in range(AUTOMATION_COUNTDOWN, 0, -1):
-        print(f"  Starting in {i}...  ", end='\r', flush=True)
+        # Resolve's fu_stdout has no flush(); omit flush=True.
+        print(f"  Starting in {i}...  ", end='\r')
         time.sleep(1)
     print("  Starting!             \n")
 
